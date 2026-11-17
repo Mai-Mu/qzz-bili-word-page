@@ -3,10 +3,12 @@ import {
   getFavoriteFolders,
   getFavoritePage,
   getSession,
+  getUploaderVideos,
   getVideoCover,
   getVideoParts,
   searchVideos,
 } from "./bili-api.js";
+import { createDownloadDialog } from "./download-dialog.js";
 import { createMediaSession } from "./media-session.js";
 import { createPlayer } from "./player.js";
 
@@ -38,6 +40,7 @@ const ui = {
   pageInput: element("page-input"),
   pageRetry: element("page-retry"),
   nowCover: element("now-cover"),
+  openCurrentVideo: element("open-current-video"),
   nowTitle: element("now-title"),
   nowDetail: element("now-detail"),
   playerMessage: element("player-message"),
@@ -47,15 +50,22 @@ const ui = {
   previous: element("previous"),
   play: element("play"),
   next: element("next"),
-  shuffle: element("shuffle"),
-  repeat: element("repeat"),
+  downloadAudio: element("download-audio"),
+  playMode: element("play-mode"),
   volume: element("volume"),
 };
 
+const listBack = document.createElement("button");
+listBack.type = "button";
+listBack.className = "quiet-button list-back";
+listBack.textContent = "返回列表";
+listBack.hidden = true;
+ui.listTitle.parentElement.before(listBack);
+
 const issues = new Map();
 const visibleRows = new Map();
-const repeatModes = ["off", "list", "part"];
-const repeatLabels = { off: "循环关闭", list: "列表循环", part: "单曲循环" };
+const playModes = ["order", "shuffle", "repeat-part"];
+const playModeLabels = { order: "顺序播放", shuffle: "随机播放", "repeat-part": "单曲循环" };
 const nativePageSize = 20;
 const listingPageSize = 100;
 const batchesPerPage = listingPageSize / nativePageSize;
@@ -88,8 +98,8 @@ function setControlLabel(button, label) {
   button.setAttribute("aria-label", label);
 }
 
-function nextRepeatMode(mode) {
-  return repeatModes[(repeatModes.indexOf(mode) + 1) % repeatModes.length];
+function nextPlayMode(mode) {
+  return playModes[(playModes.indexOf(mode) + 1) % playModes.length];
 }
 
 function errorMessage(error, fallback) {
@@ -281,12 +291,15 @@ function renderListing() {
   let meta = "";
 
   if (listing) {
-    title = source.type === "search" ? `“${source.query}”的搜索结果` : source.title;
+    title = source.title;
+    if (source.type === "search") title = `“${source.query}”的搜索结果`;
+    if (source.type === "uploader") title = `${source.title}的投稿`;
     if (listing.loading) message = "正在加载…";
     else if (listing.error) message = listing.error;
     else if (!listing.items.length) {
       if (listing.nextPage !== null) message = "这一页没有视频。";
       else if (source.type === "search") message = "没有找到相关视频。";
+      else if (source.type === "uploader") message = "该 UP 主暂无可见投稿。";
       else message = source.keyword ? "当前收藏夹没有匹配的视频。" : "这个收藏夹没有视频。";
     }
     if (listing.totalItems !== null) {
@@ -294,11 +307,13 @@ function renderListing() {
     } else if (listing.items.length) {
       meta = `本页 ${listing.items.length} 条`;
     }
+    if (source.type === "uploader") meta = [meta, "按播放量排序"].filter(Boolean).join(" · ");
   }
 
   setText(ui.listTitle, title);
   setText(ui.listMeta, meta);
   setText(ui.listMessage, message);
+  listBack.hidden = !listing?.back;
   ui.listMeta.hidden = !meta;
   ui.trackList.hidden = !listing?.items.length;
   renderPagination(listing);
@@ -307,6 +322,38 @@ function renderListing() {
 function renderRowIssue(row, reason) {
   setText(row.issue, reason);
   row.issue.hidden = !reason;
+}
+
+function authorCell(item, index) {
+  const cell = document.createElement("td");
+  cell.className = "track-author";
+  cell.title = item.author || "";
+  if (!item.author || !Number.isSafeInteger(item.authorId) || item.authorId < 1) {
+    cell.textContent = item.author || "—";
+    return cell;
+  }
+
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "track-author-button";
+  button.textContent = item.author;
+  button.setAttribute("aria-label", `查看 ${item.author} 的投稿`);
+  button.addEventListener("click", (event) => {
+    if (accountChanging) return;
+    const source = {
+      type: "uploader",
+      id: String(item.authorId),
+      title: item.author,
+      accountId: accountId ?? null,
+    };
+    if (sameSource(listing?.source, source)) return;
+
+    const back = { list: listing, scrollTop: ui.content.scrollTop, index };
+    selectListing(source, { back });
+    if (event.detail === 0) listBack.focus({ preventScroll: true });
+  });
+  cell.append(button);
+  return cell;
 }
 
 function renderRows(list) {
@@ -320,21 +367,19 @@ function renderRows(list) {
     const titleCell = document.createElement("td");
     const button = document.createElement("button");
     const issue = document.createElement("span");
-    const author = document.createElement("td");
+    const author = authorCell(item, index);
     const duration = document.createElement("td");
 
     button.type = "button";
     button.className = "track-title";
     button.textContent = item.title;
+    button.title = item.title;
     button.disabled = Boolean(item.unavailable);
     button.addEventListener("click", () => {
       void playTrack(list, page, index);
     });
 
     issue.className = "track-issue";
-    author.className = "track-author";
-    author.textContent = item.author || "—";
-    if (item.author) author.title = item.author;
     duration.className = "duration";
     duration.textContent = formatTime(item.duration);
     titleCell.append(button, issue);
@@ -363,33 +408,46 @@ function highlightPlayingRow() {
   highlightedRow = row;
 }
 
-function selectListing(source, { page = 1, totalItems = null, preserveFolderInput = false } = {}) {
+function showListing(list, { preserveFolderInput = false, scrollTop = 0 } = {}) {
   clearTimeout(folderSearchTimer);
   listing?.controller?.abort();
-  if (!Number.isSafeInteger(page) || page < 1) page = 1;
-  if (totalItems !== null) {
-    page = Math.min(page, Math.max(1, Math.ceil(totalItems / listingPageSize)));
+  listing = list;
+
+  if (listing) renderRows(listing);
+  else {
+    visibleRows.clear();
+    highlightedRow = null;
+    ui.trackRows.replaceChildren();
   }
-  listing = source ? {
-    source, page, totalItems, items: [], pages: new Map(), nextPage: null,
-    totalNativePages: null, availablePages: page, lastPage: null,
-  } : null;
-  visibleRows.clear();
-  highlightedRow = null;
-  ui.trackRows.replaceChildren();
-  ui.content.scrollTop = 0;
   markSelectedFolder();
 
+  const source = listing?.source;
   ui.folderSearchForm.hidden = source?.type !== "favorite";
   if (!preserveFolderInput) ui.folderSearchInput.value = source?.keyword || "";
   ui.folderSearchClear.hidden = !ui.folderSearchInput.value;
   renderListing();
-  if (listing) void loadListingPage(listing, page);
+  ui.content.scrollTop = scrollTop;
+}
+
+function selectListing(source, { page = 1, totalItems = null, preserveFolderInput = false, back = null } = {}) {
+  if (!Number.isSafeInteger(page) || page < 1) page = 1;
+  if (totalItems !== null) {
+    page = Math.min(page, Math.max(1, Math.ceil(totalItems / listingPageSize)));
+  }
+  const list = source ? {
+    source, page, totalItems, items: [], pages: new Map(), nextPage: null,
+    totalNativePages: null, availablePages: page, lastPage: null, back,
+  } : null;
+  showListing(list, { preserveFolderInput });
+  if (list) void loadListingPage(list, page);
 }
 
 function fetchPage(source, page, options) {
   if (source.type === "favorite") {
     return getFavoritePage(source.id, page, { ...options, keyword: source.keyword });
+  }
+  if (source.type === "uploader") {
+    return getUploaderVideos(source.id, page, { ...options, authorName: source.title });
   }
   return searchVideos(source.query, page, options);
 }
@@ -403,9 +461,14 @@ async function collectNativePages(list, page, signal) {
   for (let nativePage = start; nativePage < start + batchesPerPage; nativePage++) {
     let batch = list.pages.get(nativePage);
     if (!batch) {
-      batch = await fetchPage(list.source, nativePage, { signal });
-      signal.throwIfAborted();
-      list.pages.set(nativePage, batch);
+      try {
+        batch = await fetchPage(list.source, nativePage, { signal });
+        signal.throwIfAborted();
+        list.pages.set(nativePage, batch);
+      } catch (error) {
+        if (signal.aborted || list.source.type !== "uploader" || !items.length) throw error;
+        return { items, nextPage: nativePage, error };
+      }
     }
 
     if (Number.isSafeInteger(batch.totalItems) && batch.totalItems >= 0) {
@@ -430,7 +493,7 @@ async function collectNativePages(list, page, signal) {
 async function loadListingPage(list, targetPage) {
   if (!list || list !== listing || !Number.isSafeInteger(targetPage) || targetPage < 1) return;
   const page = Math.min(targetPage, pageLimit(list));
-  if (page === list.page && (list.loading || list.loaded)) return;
+  if (page === list.page && (list.loading || (list.loaded && !list.error))) return;
 
   list.controller?.abort();
   const controller = new AbortController();
@@ -452,7 +515,10 @@ async function loadListingPage(list, targetPage) {
     list.items = result.items;
     list.nextPage = result.nextPage;
     list.loaded = true;
-    if (list.nextPage !== null) {
+    if (result.error) {
+      handleSiteAccess(result.error);
+      list.error = `本页已加载 ${list.items.length} 条。${errorMessage(result.error, "其余投稿加载失败，请重试。")}`;
+    } else if (list.nextPage !== null) {
       list.availablePages = Math.max(list.availablePages, page + 1);
     } else if (list.items.length || page === 1) {
       list.lastPage = page;
@@ -499,13 +565,67 @@ function describeQuality(track) {
   return [label, `约 ${bitrate} kbps`].filter(Boolean).join(" · ");
 }
 
+async function callDownloadWorker(type, options) {
+  const result = await chrome.runtime.sendMessage({ target: "download-jobs", type, ...options });
+  if (!result?.ok || result.status === "needs-recovery") {
+    const error = new Error(result?.error || "音频下载失败，请重试。");
+    error.jobId = result?.jobId;
+    error.canSaveOriginal = result?.canSaveOriginal === true;
+    throw error;
+  }
+  return result;
+}
+
+const downloadDialog = createDownloadDialog({
+  async loadTracks({ bvid, cid }, { signal }) {
+    const tracks = await withSiteAccess(getAudioTracks(bvid, cid, { signal }));
+    return tracks.map(track => ({ id: track.id, codecs: track.codecs, label: describeQuality(track) }));
+  },
+  async save(snapshot, { title, artist, track, embedMetadata, saveCover, signal, onProgress, pendingJobId, saveOriginal }) {
+    let result;
+    if (pendingJobId) {
+      onProgress({ message: "正在处理缓存的音频…" });
+      result = await callDownloadWorker("RECOVER_AUDIO_DOWNLOAD", { jobId: pendingJobId, original: saveOriginal });
+    } else {
+      onProgress({ message: "正在获取音频地址…" });
+      // Signed CDN addresses may expire while the download options are open.
+      const tracks = await withSiteAccess(getAudioTracks(snapshot.bvid, snapshot.cid, { signal }));
+      const selected = tracks.find(candidate => candidate.id === track.id && candidate.codecs === track.codecs);
+      if (!selected) throw new Error("所选音质已不可用，请重新打开下载面板。");
+
+      const coverUrl = (embedMetadata || saveCover)
+        ? snapshot.cover || await getVideoCover(snapshot.bvid, { signal }).catch(() => "")
+        : "";
+      signal?.throwIfAborted();
+      onProgress({ message: "正在读取音频并准备保存…" });
+      result = await callDownloadWorker("START_AUDIO_DOWNLOAD", {
+        audioUrls: selected.urls,
+        coverUrl,
+        songName: title,
+        artist,
+        embedMeta: embedMetadata,
+        includeCover: saveCover,
+      });
+    }
+
+    const status = result.status === "complete" ? "已保存" : "已提交到浏览器下载";
+    const coverNote = result.coverStatus === "failed"
+      ? `\n封面另存失败${result.coverError ? `（${result.coverError}）` : ""}。`
+      : "";
+    return { message: `${status} ${result.filename}${coverNote}` };
+  },
+  release(_snapshot, jobId) {
+    return callDownloadWorker("RELEASE_AUDIO_DOWNLOAD", { jobId }).catch(() => {});
+  },
+});
+
 function renderCover({ item, status }) {
   const bvid = item?.bvid || "";
   if (bvid !== coverBvid) {
     coverRequest?.abort();
     coverRequest = undefined;
     coverBvid = bvid;
-    ui.nowCover.hidden = true;
+    ui.openCurrentVideo.hidden = true;
     ui.nowCover.removeAttribute("src");
   }
   if (status !== "playing" || !bvid || coverRequest) return;
@@ -529,7 +649,7 @@ function renderPlayer(state) {
   }
   playerState = state;
   renderCover(state);
-  updateMediaSession(state, ui.nowCover.hidden ? "" : ui.nowCover.currentSrc);
+  updateMediaSession(state, ui.openCurrentVideo.hidden ? "" : ui.nowCover.currentSrc);
 
   const partPage = state.part?.page;
   const multipleParts = state.parts?.length > 1 || state.item?.partCount > 1;
@@ -565,14 +685,10 @@ function renderPlayer(state) {
   ui.play.disabled = !state.item;
   ui.previous.disabled = !state.canPrevious;
   ui.next.disabled = !state.canNext;
-  ui.shuffle.dataset.icon = state.shuffle ? "shuffle" : "order";
-  ui.shuffle.setAttribute("aria-pressed", String(state.shuffle));
-  ui.shuffle.title = state.shuffle ? "随机播放 · 切换到顺序播放" : "顺序播放 · 切换到随机播放";
-  const followingRepeat = nextRepeatMode(state.repeat);
-  const repeatAction = followingRepeat === "off" ? "关闭循环" : `切换到${repeatLabels[followingRepeat]}`;
-  ui.repeat.dataset.icon = state.repeat === "part" ? "repeat-part" : "repeat";
-  ui.repeat.dataset.active = String(state.repeat !== "off");
-  setControlLabel(ui.repeat, `${repeatLabels[state.repeat]} · ${repeatAction}`);
+  ui.downloadAudio.disabled = !state.item?.bvid || !state.part?.cid;
+  ui.playMode.dataset.icon = state.mode;
+  ui.playMode.dataset.active = String(state.mode !== "order");
+  setControlLabel(ui.playMode, `${playModeLabels[state.mode]} · 切换到${playModeLabels[nextPlayMode(state.mode)]}`);
 
   if (Number.isFinite(state.volume)) ui.volume.value = String(state.volume);
   highlightPlayingRow();
@@ -624,15 +740,17 @@ async function initializePlayer() {
   playerReady = true;
 }
 
-function syncFolderListing() {
-  if (listing?.source.type === "search") return;
+function restorePublicListing() {
+  if (listing) return;
+  const saved = playerState?.source;
+  if (saved?.type !== "search" && saved?.type !== "uploader") return;
 
-  if (!listing && playerState?.source?.type === "search") {
-    const saved = playerState.source;
-    ui.searchInput.value = saved.query;
-    selectListing(saved, { page: saved.startPage });
-    return;
-  }
+  if (saved.type === "search") ui.searchInput.value = saved.query;
+  selectListing(saved, { page: saved.startPage });
+}
+
+function syncFolderListing() {
+  if (listing && listing.source.type !== "favorite") return;
 
   const previous = listing?.source ?? playerState?.source;
   const preferredId = previous?.type === "favorite" ? String(previous.id) : null;
@@ -674,11 +792,12 @@ async function refreshSession() {
     accountAvatar = session.avatar || "";
     needsLogin = false;
     needsSiteVisit = false;
-    if (listing?.source.type === "search" && listing.source.accountId !== owner) {
+    if (listing && listing.source.type !== "favorite" && listing.source.accountId !== owner) {
       selectListing({ ...listing.source, accountId: owner }, { page: listing.page });
     }
     if (!playerReady || changed) await initializePlayer();
     accountChanging = false;
+    restorePublicListing();
 
     favoritesMessage = owner ? "正在加载收藏夹…" : "登录 B 站网页后，点「刷新收藏夹」。";
     renderAccount();
@@ -731,17 +850,32 @@ ui.searchForm.addEventListener("submit", (event) => {
   });
 });
 
+listBack.addEventListener("click", () => {
+  const back = listing?.back;
+  if (accountChanging || !back?.list) return;
+  showListing(back.list, { scrollTop: back.scrollTop });
+  ui.trackRows.rows[back.index]?.querySelector(".track-author-button")?.focus({ preventScroll: true });
+});
+
 ui.accountAvatar.addEventListener("load", () => {
   ui.accountAvatar.hidden = !ui.accountAvatar.naturalWidth;
 });
 ui.accountAvatar.addEventListener("error", () => { ui.accountAvatar.hidden = true; });
 ui.nowCover.addEventListener("load", () => {
-  ui.nowCover.hidden = !ui.nowCover.naturalWidth;
-  if (playerState) updateMediaSession(playerState, ui.nowCover.hidden ? "" : ui.nowCover.currentSrc);
+  ui.openCurrentVideo.hidden = !ui.nowCover.naturalWidth;
+  if (playerState) updateMediaSession(playerState, ui.openCurrentVideo.hidden ? "" : ui.nowCover.currentSrc);
 });
 ui.nowCover.addEventListener("error", () => {
-  ui.nowCover.hidden = true;
+  ui.openCurrentVideo.hidden = true;
   if (playerState) updateMediaSession(playerState);
+});
+ui.openCurrentVideo.addEventListener("click", () => {
+  const { item, part } = playerState ?? {};
+  if (!item?.bvid || !window.confirm("在新标签页打开当前视频的 B 站播放页面？")) return;
+
+  const url = new URL(`https://www.bilibili.com/video/${encodeURIComponent(item.bvid)}/`);
+  if (part?.page > 1) url.searchParams.set("p", part.page);
+  void chrome.tabs.create({ url: url.href });
 });
 ui.refreshSession.addEventListener("click", () => { void refreshSession(); });
 ui.folderSearchForm.addEventListener("submit", (event) => {
@@ -778,12 +912,21 @@ ui.previous.addEventListener("click", () => {
 ui.next.addEventListener("click", () => {
   if (!accountChanging) void player.next();
 });
-ui.shuffle.addEventListener("click", () => {
-  if (playerReady && !accountChanging) player.setShuffle(!playerState.shuffle);
+ui.downloadAudio.addEventListener("click", () => {
+  const { item, part, parts } = playerState ?? {};
+  if (accountChanging || !item?.bvid || !part?.cid) return;
+
+  const multiPart = parts.length > 1 || item.partCount > 1 || part.page > 1;
+  downloadDialog.open({
+    bvid: item.bvid,
+    cid: part.cid,
+    title: (multiPart && part.title) || item.title,
+    artist: item.author,
+    cover: item.cover,
+  });
 });
-ui.repeat.addEventListener("click", () => {
-  if (!playerReady || accountChanging) return;
-  player.setRepeat(nextRepeatMode(playerState.repeat));
+ui.playMode.addEventListener("click", () => {
+  if (playerReady && !accountChanging) player.setMode(nextPlayMode(playerState.mode));
 });
 ui.volume.addEventListener("input", () => {
   if (playerReady && !accountChanging) player.setVolume(ui.volume.valueAsNumber);

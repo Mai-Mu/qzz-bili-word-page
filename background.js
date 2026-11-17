@@ -1,19 +1,22 @@
+importScripts('src/download-jobs.js');
+
 const playerUrl = chrome.runtime.getURL('index.html');
 const requestHeader = { header: 'referer', operation: 'set', value: 'https://www.bilibili.com/' };
 
 // The site's Web API and media CDN expect a Bilibili referrer. Scope it to requests
 // initiated by this extension, including playback in its own tab.
 const refererRules = [
-  { id: 1, domains: ['api.bilibili.com'], resourceType: 'xmlhttprequest' },
-  { id: 2, domains: ['bilivideo.com', 'bilivideo.cn'], resourceType: 'media' },
-].map(({ id, domains, resourceType }) => ({
+  { id: 1, domains: ['api.bilibili.com'], resourceTypes: ['xmlhttprequest'] },
+  { id: 2, domains: ['bilivideo.com', 'bilivideo.cn'], resourceTypes: ['media', 'xmlhttprequest'] },
+  { id: 3, domains: ['i0.hdslb.com', 'i1.hdslb.com', 'i2.hdslb.com'], resourceTypes: ['xmlhttprequest'] },
+].map(({ id, domains, resourceTypes }) => ({
   id,
   action: { type: 'modifyHeaders', requestHeaders: [requestHeader] },
   condition: {
     initiatorDomains: [chrome.runtime.id],
     requestDomains: domains,
     requestMethods: ['get', 'head'],
-    resourceTypes: [resourceType],
+    resourceTypes,
   },
 }));
 

@@ -1,17 +1,22 @@
 const API_ORIGIN = "https://api.bilibili.com";
 const PAGE_SIZE = 20;
+const UPLOADER_BATCH_SIZE = 100;
 const REQUEST_TIMEOUT_MS = 20_000;
 const BVID_PATTERN = /^BV[0-9A-Za-z]{10}$/;
+const uploaderNames = new Map();
+const uploaderPages = new Map();
+const uploaderSmallBatches = new Set();
 
 const AUDIO_QUALITIES = {
   30216: "AAC 低码率",
+  30206: "AAC 128K（旧）",
   30232: "AAC 标准",
   30280: "AAC 高音质",
   30250: "杜比全景声",
   30251: "FLAC 无损",
 };
 
-const AAC_NOMINAL_BITRATES = { 30216: 64, 30232: 132, 30280: 192 };
+const AAC_NOMINAL_BITRATES = { 30216: 64, 30206: 128, 30232: 132, 30280: 192 };
 
 export class BiliApiError extends Error {
   constructor(code, message, { biliCode = null, httpStatus = null } = {}) {
@@ -215,6 +220,7 @@ export async function getFavoritePage(folderId, page = 1, { signal, keyword } = 
       bvid,
       title: item.title || "未命名条目",
       author: item.upper?.name || "",
+      authorId: positiveId(item.upper?.mid),
       cover: trustedImageUrl(item.cover),
       duration: durationSeconds(item.duration),
       partCount: item.type === 2 ? positiveId(item.page) : null,
@@ -246,6 +252,7 @@ export async function searchVideos(query, page = 1, { signal } = {}) {
       bvid: item.bvid,
       title: plainSearchText(item.title) || "未命名视频",
       author: plainSearchText(item.author),
+      authorId: positiveId(item.mid),
       cover: trustedImageUrl(item.pic),
       duration: durationSeconds(item.duration),
       partCount: null,
@@ -257,6 +264,91 @@ export async function searchVideos(query, page = 1, { signal } = {}) {
     totalItems: nonnegativeCount(data?.numResults),
     totalPages: nonnegativeCount(data?.numPages),
   };
+}
+
+async function loadUploaderName(mid, signal) {
+  if (uploaderNames.has(mid)) return uploaderNames.get(mid);
+  try {
+    const data = await request("/x/web-interface/card", { mid, photo: false }, "读取 UP 主名称", signal);
+    const name = typeof data?.card?.name === "string" ? data.card.name : "";
+    if (name) uploaderNames.set(mid, name);
+    return name;
+  } catch {
+    signal?.throwIfAborted();
+    return "";
+  }
+}
+
+async function loadUploaderPage(mid, page, pageSize, signal) {
+  const key = `${mid}:${pageSize}:${page}`;
+  const cached = uploaderPages.get(key);
+  if (cached) return cached;
+
+  const data = await request("/x/series/recArchivesByKeywords", {
+    mid,
+    keywords: "",
+    pn: page,
+    ps: pageSize,
+    orderby: "views",
+  }, "读取 UP 主投稿", signal);
+  const totalItems = nonnegativeCount(data?.page?.total);
+  const archives = data?.archives ?? [];
+  if (totalItems === null || data?.page?.size !== pageSize || data?.page?.num !== page || !Array.isArray(archives)) {
+    throw new BiliApiError("bad-response", "B 站返回了无法识别的投稿列表。");
+  }
+  if (!archives.length && page <= Math.ceil(totalItems / pageSize)) {
+    throw new BiliApiError("unavailable", "B 站没有返回这一页的投稿，请重试或到 B 站查看。");
+  }
+  signal?.throwIfAborted();
+  const listing = uploaderPages.get(key) ?? { archives, totalItems };
+  uploaderPages.set(key, listing);
+  return listing;
+}
+
+export async function getUploaderVideos(mid, page = 1, { signal, authorName } = {}) {
+  const authorId = requireId(mid, "UP 主编号");
+  const pageNumber = requireId(page, "页码");
+  signal?.throwIfAborted();
+
+  // The interface already groups five 20-item pages. Share a native 100-item
+  // response across those pages and across on-demand playback requests.
+  const offset = (pageNumber - 1) * PAGE_SIZE;
+  const batchPage = Math.floor(offset / UPLOADER_BATCH_SIZE) + 1;
+  const batchKey = `${authorId}:${batchPage}`;
+  let listing;
+  let start = offset % UPLOADER_BATCH_SIZE;
+  if (uploaderSmallBatches.has(batchKey)) {
+    listing = await loadUploaderPage(authorId, pageNumber, PAGE_SIZE, signal);
+    start = 0;
+  } else {
+    try {
+      listing = await loadUploaderPage(authorId, batchPage, UPLOADER_BATCH_SIZE, signal);
+    } catch (error) {
+      if (error.code !== "blocked") throw error;
+      listing = await loadUploaderPage(authorId, pageNumber, PAGE_SIZE, signal);
+      uploaderSmallBatches.add(batchKey);
+      start = 0;
+    }
+  }
+
+  const { archives, totalItems } = listing;
+  const pageArchives = archives.slice(start, start + PAGE_SIZE);
+  let author = typeof authorName === "string" ? authorName.trim() : "";
+  if (!author && pageArchives.length) author = await loadUploaderName(authorId, signal);
+  const items = pageArchives
+    .filter(item => typeof item?.bvid === "string" && BVID_PATTERN.test(item.bvid))
+    .map(item => ({
+      bvid: item.bvid,
+      title: item.title || "未命名视频",
+      author,
+      authorId,
+      cover: trustedImageUrl(item.pic),
+      duration: durationSeconds(item.duration),
+      partCount: null,
+      unavailable: "",
+    }));
+  const totalPages = Math.ceil(totalItems / PAGE_SIZE);
+  return { items, hasMore: pageNumber < totalPages, totalItems, totalPages };
 }
 
 export async function getVideoCover(bvid, { signal } = {}) {
@@ -313,6 +405,7 @@ function normalizeAudioTrack(track) {
   const quality = AUDIO_QUALITIES[id] || codecs || "音频";
   const rank = id === 30251 ? 2 : id === 30250 ? 1 : 0;
   return {
+    id: Number.isFinite(id) ? id : null,
     rank,
     sortBitrate: AAC_NOMINAL_BITRATES[id] ?? bitrate ?? 0,
     urls,

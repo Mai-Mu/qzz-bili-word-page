@@ -2,11 +2,12 @@ const GLOBAL_ERRORS = new Set(['auth', 'blocked', 'rate-limit', 'network', 'time
 const PROGRESS_SAVE_INTERVAL = 2_000;
 const MAX_EMPTY_PAGES = 5;
 const MEDIA_START_TIMEOUT = 10_000;
+const PLAYBACK_MODES = new Set(['order', 'shuffle', 'repeat-part']);
 
 function emptyState() {
   return {
     items: [], order: [], cursor: -1, source: null, parts: [], partIndex: 0,
-    position: 0, duration: 0, volume: 1, shuffle: false, repeat: 'off',
+    position: 0, duration: 0, volume: 1, mode: 'order',
     status: 'idle', error: null, track: null,
   };
 }
@@ -36,7 +37,6 @@ export function createPlayer({ audio, loadParts, loadTracks, loadMore, storage, 
   let pendingSave;
   let saving;
   const partCache = new Map();
-  const failedParts = new Set();
 
   const item = () => state.items[state.order[state.cursor]] ?? null;
   const part = () => state.parts[state.partIndex] ?? null;
@@ -47,14 +47,12 @@ export function createPlayer({ audio, loadParts, loadTracks, loadMore, storage, 
       items: state.items, index: state.order[state.cursor] ?? -1, source: state.source,
       item: item(), parts: state.parts, partIndex: state.partIndex, part: part(),
       position: state.position, duration: state.duration, volume: state.volume,
-      shuffle: state.shuffle, repeat: state.repeat, status: state.status,
+      mode: state.mode, status: state.status,
       error: state.error, track: state.track,
-      canPrevious: Boolean(item() && (
-        state.partIndex > 0 || state.cursor > 0 || (state.repeat === 'list' && state.order.length > 1)
-      )),
+      canPrevious: Boolean(item() && (state.partIndex > 0 || state.cursor > 0)),
       canNext: Boolean(item() && (
         state.partIndex + 1 < (state.parts.length || item().partCount || 1) ||
-        state.cursor + 1 < state.order.length || hasMore() || state.repeat === 'list'
+        state.cursor + 1 < state.order.length || hasMore()
       )),
     });
   }
@@ -65,7 +63,8 @@ export function createPlayer({ audio, loadParts, loadTracks, loadMore, storage, 
     pendingSave = {
       items: state.items, order: state.order, cursor: state.cursor, source: state.source,
       parts: state.parts, partIndex: state.partIndex, position: state.position,
-      volume: state.volume, shuffle: state.shuffle, repeat: state.repeat,
+      volume: state.volume, shuffle: state.mode === 'shuffle',
+      repeat: state.mode === 'repeat-part' ? 'part' : 'off',
     };
     if (!saving) {
       saving = Promise.resolve().then(async () => {
@@ -152,7 +151,7 @@ export function createPlayer({ audio, loadParts, loadTracks, loadMore, storage, 
       state.source = { ...state.source, nextPage: result.hasMore ? page + 1 : null };
       if (added.length) {
         const indices = added.map((_, index) => state.items.length + index);
-        state.order = state.order.concat(state.shuffle ? shuffleOrder(indices) : indices);
+        state.order = state.order.concat(state.mode === 'shuffle' ? shuffleOrder(indices) : indices);
         state.items = state.items.concat(added);
         save();
         return;
@@ -287,7 +286,6 @@ export function createPlayer({ audio, loadParts, loadTracks, loadMore, storage, 
   }
 
   async function walk(target, direction, signal, skipped = false) {
-    const visited = new Set();
     while (target) {
       signal.throwIfAborted();
       loadingTarget = target;
@@ -301,21 +299,9 @@ export function createPlayer({ audio, loadParts, loadTracks, loadMore, storage, 
           return;
         }
       }
-      if (target.cursor < 0 || target.cursor >= state.order.length) {
-        if (state.repeat !== 'list' || !state.order.length) break;
-        target = { ...target, cursor: direction > 0 ? 0 : state.order.length - 1 };
-      }
+      if (target.cursor < 0 || target.cursor >= state.order.length) break;
 
-      const itemIndex = state.order[target.cursor];
-      const entry = state.items[itemIndex];
-      const partsKey = `${itemIndex}:parts`;
-      if (failedParts.has(partsKey)) {
-        if (visited.has(partsKey)) break;
-        visited.add(partsKey);
-        skipped = true;
-        target = { cursor: target.cursor + direction, partIndex: direction > 0 ? 0 : -1, position: 0 };
-        continue;
-      }
+      const entry = state.items[state.order[target.cursor]];
       const cached = partCache.get(entry.bvid);
       select(target, cached ?? (target.cursor === state.cursor ? state.parts : []));
       try {
@@ -338,8 +324,6 @@ export function createPlayer({ audio, loadParts, loadTracks, loadMore, storage, 
           showError(error, '无法载入视频，请重试');
           return;
         }
-        visited.add(partsKey);
-        failedParts.add(partsKey);
         skipped = true;
         onIssue?.(entry, issueMessage(error, '无法读取视频分 P'));
         target = { cursor: target.cursor + direction, partIndex: direction > 0 ? 0 : -1, position: 0 };
@@ -347,15 +331,7 @@ export function createPlayer({ audio, loadParts, loadTracks, loadMore, storage, 
       }
 
       const { cid } = part();
-      const key = `${itemIndex}:part:${cid}`;
-      if (visited.has(key)) break;
-      visited.add(key);
-      if (failedParts.has(key)) {
-        skipped = true;
-        target = adjacentPart(direction);
-        continue;
-      }
-      const session = { bvid: entry.bvid, cid, key, refreshed: false };
+      const session = { bvid: entry.bvid, cid, refreshed: false };
       try {
         await loadCandidates(session, signal);
         await tryMedia(session, signal);
@@ -367,7 +343,6 @@ export function createPlayer({ audio, loadParts, loadTracks, loadMore, storage, 
           return;
         }
         skipped = true;
-        failedParts.add(key);
         onIssue?.(entry, issueMessage(error, '音轨无法播放'));
         target = adjacentPart(direction);
       }
@@ -398,17 +373,16 @@ export function createPlayer({ audio, loadParts, loadTracks, loadMore, storage, 
 
   function move(direction, automatic = false) {
     if (!item()) return;
-    if (!automatic) failedParts.clear();
     sampleProgress();
     if (direction > 0 && !automatic && !state.parts.length && !item().unavailable &&
         (item().partCount == null || item().partCount > state.partIndex + 1)) {
       return playTarget({ cursor: state.cursor, partIndex: state.partIndex + 1, position: 0, nextPart: true });
     }
-    const target = automatic && state.repeat === 'part'
+    const target = automatic && state.mode === 'repeat-part'
       ? { cursor: state.cursor, partIndex: state.partIndex, position: 0 }
       : adjacentPart(direction);
     const known = target.cursor >= 0 && target.cursor < state.order.length;
-    if (automatic || known || (direction > 0 && hasMore()) || state.repeat === 'list') {
+    if (automatic || known || (direction > 0 && hasMore())) {
       return playTarget(target, direction);
     }
   }
@@ -430,7 +404,6 @@ export function createPlayer({ audio, loadParts, loadTracks, loadMore, storage, 
           showError(error, '无法重新载入音轨，请重试');
           return;
         }
-        failedParts.add(session.key);
         onIssue?.(item(), issueMessage(error, '音轨播放失败'));
         await walk(adjacentPart(1), 1, signal, true);
       }
@@ -464,8 +437,7 @@ export function createPlayer({ audio, loadParts, loadTracks, loadMore, storage, 
     }
     if (activeController !== controller) return;
     if (saved) {
-      state.repeat = ['off', 'list', 'part'].includes(saved.repeat) ? saved.repeat : 'off';
-      state.shuffle = Boolean(saved.shuffle);
+      state.mode = saved.repeat === 'part' ? 'repeat-part' : saved.shuffle ? 'shuffle' : 'order';
       state.volume = Number.isFinite(saved.volume) ? Math.max(0, Math.min(1, saved.volume)) : 1;
       restore(saved);
     }
@@ -479,19 +451,18 @@ export function createPlayer({ audio, loadParts, loadTracks, loadMore, storage, 
     begin();
     state = emptyState();
     partCache.clear();
-    failedParts.clear();
     publish();
     await flushed;
   }
 
   function start(items, index, source) {
     if (!items[index]?.bvid) return;
-    failedParts.clear();
     const indices = items.map((_, position) => position);
     state.items = [...items];
     state.source = source ? { ...source } : null;
-    state.order = state.shuffle ? [index, ...shuffleOrder(indices.filter(position => position !== index))] : indices;
-    state.cursor = state.shuffle ? 0 : index;
+    const shuffle = state.mode === 'shuffle';
+    state.order = shuffle ? [index, ...shuffleOrder(indices.filter(position => position !== index))] : indices;
+    state.cursor = shuffle ? 0 : index;
     state.parts = [];
     state.partIndex = 0;
     state.position = 0;
@@ -526,7 +497,6 @@ export function createPlayer({ audio, loadParts, loadTracks, loadMore, storage, 
       return playTarget(target, direction);
     }
     if (!item()) return;
-    if (state.status === 'error') failedParts.clear();
     if (activeMedia && !audio.error && !audio.ended) {
       const beforePlay = activeMedia;
       const signal = controller.signal;
@@ -574,21 +544,15 @@ export function createPlayer({ audio, loadParts, loadTracks, loadMore, storage, 
     save();
   }
 
-  function setShuffle(enabled) {
-    if (Boolean(enabled) === state.shuffle) return;
-    state.shuffle = Boolean(enabled);
+  function setMode(mode) {
+    if (!PLAYBACK_MODES.has(mode) || mode === state.mode) return;
+    sampleProgress();
+    state.mode = mode;
     const end = state.cursor + 1;
     const tail = state.order.slice(end);
     state.order = state.order.slice(0, end).concat(
-      state.shuffle ? shuffleOrder(tail) : tail.sort((left, right) => left - right),
+      mode === 'shuffle' ? shuffleOrder(tail) : tail.sort((left, right) => left - right),
     );
-    publish();
-    save();
-  }
-
-  function setRepeat(mode) {
-    if (!['off', 'list', 'part'].includes(mode)) return;
-    state.repeat = mode;
     publish();
     save();
   }
@@ -623,6 +587,6 @@ export function createPlayer({ audio, loadParts, loadTracks, loadMore, storage, 
 
   return {
     initialize, reset, start, toggle, next: () => move(1), previous: () => move(-1),
-    seek, setVolume, setShuffle, setRepeat,
+    seek, setVolume, setMode,
   };
 }
