@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>B 站文字播放器</title>
+    <link rel="icon" type="image/png" sizes="32x32" href="assets/icon-32.png">
+    <link rel="stylesheet" href="src/styles.css">
+    <script type="module" src="src/app.js"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="app-name">
+        <img class="app-logo" src="assets/logo.png" alt="" width="32" height="32">
+        <span>B 站文字播放器</span>
+      </div>
+      <form class="search-form" id="search-form" role="search">
+        <label class="visually-hidden" for="search-input">搜索 B 站视频</label>
+        <input id="search-input" type="search" placeholder="搜索 B 站视频" autocomplete="off" required>
+        <button class="primary-button" type="submit">搜索</button>
+      </form>
+      <div class="account-tools">
+        <div class="account-profile">
+          <img class="account-avatar" id="account-avatar" width="28" height="28" alt="" referrerpolicy="no-referrer" hidden>
+          <span class="account-name" id="account-name" role="status"></span>
+        </div>
+        <a id="login-link" href="https://www.bilibili.com/" target="_blank" rel="noopener noreferrer" hidden>去 B 站登录</a>
+        <button class="quiet-button icon-button" id="refresh-session" data-icon="refresh" type="button" aria-label="刷新收藏夹" title="刷新收藏夹"></button>
+      </div>
+    </header>
+
+    <div class="workspace">
+      <aside class="sidebar" aria-labelledby="favorites-heading">
+        <h2 id="favorites-heading">我的收藏夹</h2>
+        <p class="sidebar-message" id="favorites-message" role="status">正在读取登录状态…</p>
+        <ul class="folders" id="favorite-folders"></ul>
+      </aside>
+
+      <div class="results-pane">
+        <div class="results-body">
+          <main class="content" id="main-content">
+            <div class="results">
+              <header class="results-header">
+                <h1 id="list-title">搜索或选择收藏夹</h1>
+                <p class="list-meta" id="list-meta" hidden></p>
+              </header>
+              <p class="list-message" id="list-message" role="status"></p>
+              <table class="track-list" id="track-list" aria-labelledby="list-title" hidden>
+                <colgroup>
+                  <col class="title-column">
+                  <col class="author-column">
+                  <col class="duration-column">
+                </colgroup>
+                <thead>
+                  <tr>
+                    <th scope="col">视频标题</th>
+                    <th scope="col">UP 主</th>
+                    <th class="duration" scope="col">时长</th>
+                  </tr>
+                </thead>
+                <tbody id="track-rows"></tbody>
+              </table>
+              <nav class="pagination" id="list-pagination" aria-label="视频列表分页" hidden>
+                <div class="pagination-controls" id="page-controls">
+                  <button class="quiet-button page-arrow" id="page-previous" type="button" aria-label="上一页" title="上一页">‹</button>
+                  <div class="page-numbers" id="page-numbers"></div>
+                  <button class="quiet-button page-arrow" id="page-next" type="button" aria-label="下一页" title="下一页">›</button>
+                </div>
+                <form class="page-jump" id="page-jump">
+                  <label for="page-input">跳至</label>
+                  <input id="page-input" type="number" min="1" step="1" inputmode="numeric" aria-label="跳转页码" required>
+                  <button class="quiet-button" type="submit">前往</button>
+                </form>
+                <button class="quiet-button" id="page-retry" type="button" hidden>重试</button>
+              </nav>
+            </div>
+          </main>
+          <form class="folder-search" id="folder-search-form" role="search" aria-label="搜索当前收藏夹" hidden>
+            <label class="visually-hidden" for="folder-search-input">搜索当前收藏夹</label>
+            <input id="folder-search-input" type="search" placeholder="搜索当前收藏夹" autocomplete="off">
+            <button class="quiet-button folder-search-clear" id="folder-search-clear" type="button" aria-label="清空收藏夹搜索" title="清空收藏夹搜索" hidden>×</button>
+            <button class="primary-button" type="submit">搜索</button>
+          </form>
+        </div>
+      </div>
+    </div>
+
+    <footer class="player" aria-label="音频播放器">
+      <div class="now-playing">
+        <img class="now-cover" id="now-cover" width="80" height="45" alt="" referrerpolicy="no-referrer" hidden>
+        <div class="now-info">
+          <p class="now-title" id="now-title">未开始播放</p>
+          <p class="now-detail" id="now-detail"></p>
+          <p class="player-message" id="player-message" role="status" hidden></p>
+        </div>
+      </div>
+
+      <div class="player-main">
+        <div class="transport" role="group" aria-label="播放控制">
+          <button class="quiet-button icon-button" id="previous" data-icon="previous" type="button" aria-label="上一条" title="上一条" disabled></button>
+          <button class="primary-button icon-button play-button" id="play" data-icon="play" type="button" aria-label="播放" title="播放" disabled></button>
+          <button class="quiet-button icon-button" id="next" data-icon="next" type="button" aria-label="下一条" title="下一条" disabled></button>
+        </div>
+        <div class="timeline">
+          <span id="position-text">0:00</span>
+          <input id="seek" type="range" min="0" max="1" step="1" value="0" aria-label="播放进度" disabled>
+          <span id="duration-text">—</span>
+        </div>
+      </div>
+
+      <div class="player-settings">
+        <div class="modes" role="group" aria-label="播放模式">
+          <button class="quiet-button icon-button" id="shuffle" data-icon="order" type="button" aria-label="随机播放" aria-pressed="false" title="顺序播放 · 切换到随机播放"></button>
+          <button class="quiet-button icon-button" id="repeat" data-icon="repeat" type="button" aria-label="循环关闭 · 切换到列表循环" title="循环关闭 · 切换到列表循环"></button>
+        </div>
+        <label class="volume-control" title="音量">
+          <span class="control-glyph" data-icon="volume" aria-hidden="true"></span>
+          <input id="volume" type="range" min="0" max="1" step="0.01" value="1" aria-label="音量">
+        </label>
+      </div>
+      <audio id="audio" preload="none" hidden></audio>
+    </footer>
+  </body>
+</html>
