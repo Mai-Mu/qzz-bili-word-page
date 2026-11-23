@@ -6,6 +6,7 @@
     <title>B 站文字播放器</title>
     <link rel="icon" type="image/png" sizes="32x32" href="assets/icon-32.png">
     <link rel="stylesheet" href="src/styles.css">
+    <script type="module" src="src/theme.js"></script>
     <script type="module" src="src/app.js"></script>
   </head>
   <body>
@@ -26,6 +27,17 @@
         </div>
         <a id="login-link" href="https://www.bilibili.com/" target="_blank" rel="noopener noreferrer" hidden>去 B 站登录</a>
         <button class="quiet-button icon-button" id="refresh-session" data-icon="refresh" type="button" aria-label="刷新收藏夹" title="刷新收藏夹"></button>
+        <div class="theme-picker" id="theme-picker">
+          <button class="quiet-button icon-button" id="theme-toggle" data-icon="theme" type="button" popovertarget="theme-options" aria-label="切换主题" title="切换主题"></button>
+          <div class="theme-options" id="theme-options" role="group" aria-label="色彩主题" popover>
+            <button class="theme-swatch" type="button" data-theme="forest" aria-label="松林绿" title="松林绿" aria-pressed="true"></button>
+            <button class="theme-swatch" type="button" data-theme="sky" aria-label="晴空蓝" title="晴空蓝" aria-pressed="false"></button>
+            <button class="theme-swatch" type="button" data-theme="rose" aria-label="樱花粉" title="樱花粉" aria-pressed="false"></button>
+            <button class="theme-swatch" type="button" data-theme="amber" aria-label="暖琥珀" title="暖琥珀" aria-pressed="false"></button>
+            <button class="theme-swatch" type="button" data-theme="violet" aria-label="暮紫" title="暮紫" aria-pressed="false"></button>
+            <button class="theme-swatch" type="button" data-theme="midnight" aria-label="午夜蓝" title="午夜蓝" aria-pressed="false"></button>
+          </div>
+        </div>
       </div>
     </header>
 
